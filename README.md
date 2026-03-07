@@ -2,5 +2,6 @@
 
 This repo stores idea notes as standalone Markdown files.
 
-Current file:
+Current files:
 - `idea.md`
+- `qwen-next-bd.md`
