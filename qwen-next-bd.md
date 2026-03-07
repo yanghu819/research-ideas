@@ -143,6 +143,21 @@
 
 ## 6. Attention 和 SSM 各自怎么处理
 
+### 6.0 当前 HF 实现下的关键校正
+
+在当前 Hugging Face `Qwen3NextModel.forward()` 里，模型入口已经先把两类 mask 分开了：
+
+- `causal_mask` 给 `full_attention`
+- `linear_attn_mask` 给 `linear_attention`
+
+也就是说，MVP 的补丁点不该是“在 decoder layer 里硬分流同一个 mask”，而应该是：
+
+1. 在模型前向入口准备两份 mask。
+2. `full_attention` 层吃自定义 `bd_mask_4d`。
+3. `DeltaNet / linear_attention` 层继续吃 `padding_mask_2d`。
+
+这点很重要，因为 `DeltaNet` 这边仍然把 mask 当 padding mask 语义使用，不该把 4D BD mask 硬塞进去。
+
 ### 6.1 Attention 分支
 
 Attention 这边可以更“像 BD 一点”，因为它天然支持：
@@ -154,10 +169,17 @@ Attention 这边可以更“像 BD 一点”，因为它天然支持：
 最简单的实现方式是：
 
 - 训练时直接吃 `x_0(<b) + x_t(b)` 这个前缀输入
-- 推理时维护 history KV cache
-- 当前 block 每轮 refine 只重算当前 block
+- full-attention 层吃一张“裁剪版 BD” 的 4D additive mask
+- 这张 mask 只描述 `x_0(<b) + x_t(b)` 这个子图，而不是 dFactory 里的双倍长度 `[x_t | x_0]`
+- 当前 block 内部双向可见，同时对全部 clean prefix 可见
 
-如果后面需要更接近原版 BD，再额外给 attention 写更细的可见性规则。
+一个关键实现点：
+
+- 不要全局把模型切到 “non-causal decoder” 模式
+- 更稳的做法是保持模型默认配置不动，只给 full-attention 层传入准备好的 4D mask
+- 在当前 `transformers` 里，准备好的 4D mask 会直接被 `create_causal_mask()` 原样返回
+
+所以 attention 分支的 MVP 不是“全模型改成双向”，而是“只对 full-attention 层喂 reduced BD mask”。
 
 ### 6.2 SSM / FLA 分支
 
@@ -239,7 +261,7 @@ loss 只打在当前 block 里被 mask 的位置。
 
 ## 9. 推理实现建议
 
-推理时维护两类状态：
+推理语义上可以理解为维护两类状态：
 
 1. `history cache/state`
    - attention 的 KV cache
@@ -268,6 +290,23 @@ loss 只打在当前 block 里被 mask 的位置。
 
 否则状态会脏。
 
+但工程上，**第一版实现不建议立刻上 cache**。原因很简单：
+
+- attention cache 和 DeltaNet cache 都有自己的接口假设
+- Qwen-Next 当前 chunk 路径对多 token block 的状态续跑并不是现成为 BD 设计的
+
+所以 MVP 更稳的落地是：
+
+1. `use_cache=False`
+2. 每轮 refine 都把 `clean prefix + current draft block` 整段重新前向一次
+3. 只更新当前 block
+4. 等主干调通后，再做 block-boundary snapshot / commit 优化
+
+也就是说：
+
+- `history/draft 隔离` 仍然是方法目标
+- `第一版不碰 cache` 是工程简化手段
+
 ## 10. 为什么这条路值得试
 
 虽然这不是 exact BD，但它有三个现实优点：
@@ -293,12 +332,19 @@ loss 只打在当前 block 里被 mask 的位置。
 1. 固定 block size。
 2. 每步只采一个 block 做训练。
 3. 训练输入只用 `clean prefix + noisy current block`。
-4. loss 只打当前 block 的 masked positions。
-5. 推理时做 block-boundary checkpoint + whole-block rerollout。
-6. 先不追求 fancy 的 token editing、MBE、RL。
+4. 数据侧保留真 `[MASK]` token，当前 block 按 `sigma` 随机做 masking。
+5. labels 只保留当前 block 的 masked positions，loss 用 same-token sparse CE，不做 next-token shift。
+6. 模型入口显式准备两份 mask：
+   - `padding_mask_2d`
+   - `bd_mask_4d`
+7. `full_attention` 只吃 `bd_mask_4d`，而且先固定走 eager/additive mask 路径。
+8. `DeltaNet / linear_attention` 只吃 `padding_mask_2d`，不去伪装成二维 BD。
+9. 第一版训练和推理都不要依赖 `ForCausalLM.forward()` 里的现成 loss，直接取 logits 自己算 sparse CE。
+10. 第一版推理 `use_cache=False`，每轮 refine 整段重跑 `clean prefix + current draft block`。
+11. 先不追求 fancy 的 token editing、MBE、RL，也先不追求 block-boundary cache 优化。
 
 先把这条主干调通，再考虑更复杂的编辑机制。
 
 ## 13. 一句话总结
 
-**Qwen-Next 上做 Block Diffusion，不该强逼 SSM 去学 pure-attention 那套 `[x_t|x_0] + 2D mask`。更合理的做法是把 BD 改写成“clean history prefix + noisy current block”的多次前向近似版本，并在 block 边界做 state snapshot / rerollout / commit。**
+**Qwen-Next 上做 Block Diffusion，不该强逼 SSM 去学 pure-attention 那套 `[x_t|x_0] + 2D mask`。更合理的做法是把 BD 改写成“clean history prefix + noisy current block”的多次前向近似版本：full-attention 吃 reduced 4D BD mask，DeltaNet 保持 prefix recurrence，第一版整段重跑，不碰 cache 黑魔法。**
