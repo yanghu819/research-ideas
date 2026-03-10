@@ -1,6 +1,6 @@
 # Qwen-Next + Block Diffusion（近似版思路）
 
-更新时间：2026-03-07
+更新时间：2026-03-10
 
 ## 1. 目标
 
@@ -66,54 +66,78 @@
 
 只要这三条守住了，方法虽然不是“原教旨 exact BD”，但至少是自洽的 hybrid-BD。
 
-## 4. 我们的近似版本：核心 idea
+## 4. 当前 best practice：双流 causal GDN + reduced BD attention
 
 核心思路是：
 
-**别让 SSM 学二维 mask。让它做自己擅长的事情：前缀递推。**
+**别让 SSM 学二维 mask。让它只做各自流内的 causal mixing；真正的 BD 语义放到后面的 attention 里。**
 
-于是把原来 single-forward 的 BD，改写成 multi-forward 的 block-prefix 训练和推理。
+具体来说：
+
+1. 准备两条流：
+   - `x0 stream`：clean token
+   - `xt stream`：当前 block 被噪声污染后的 token
+2. 两条流各自经过独立初始化 state 的 `GDN / DeltaNet / SSM`，彼此不通信。
+3. `GDN` 阶段一律按 causal 跑，可以理解为它的 `block size = 1`。
+4. 真正的 block diffusion 语义，由后面的 full-attention 通过一张更大的 reduced BD mask 来承载。
+
+所以这版不是“SSM 自己做 BD”，而是：
+
+**dual-stream causal SSM encoder + block-masked attention fusion**
 
 ### 4.1 训练时的语义
 
 对于第 `b` 个 block：
 
-- 历史 block 用 clean token：`x_0(<b)`
-- 当前 block 用 noisy token：`x_t(b)`
+- `x0 stream` 提供 clean 视图
+- `xt stream` 提供 noisy 视图
 - 目标：恢复当前 block 的 clean token `x_0(b)`
 
-也就是：
+一种直接写法是：
 
-- `block1`：输入 `x_t(1)`
-- `block2`：输入 `x_0(1) + x_t(2)`
-- `block3`：输入 `x_0(1) + x_0(2) + x_t(3)`
-- 一般地：输入 `x_0(<b) + x_t(b)`
+- `x0 stream`: `prompt + x_0`
+- `xt stream`: `prompt + x_0(<b) + x_t(b) + tail`
 
-这和 dFactory 里 `[x_t | x_0] + BD mask` 的目标本质一致：
+这里关键不是两条流是否都完整，而是：
 
-- 历史是 clean
-- 当前块是 noisy
-- 只恢复当前块
+- `xt(b)` 在后续 attention 里只能利用允许的 clean history
+- **不能看到当前 block 的 clean `x_0(b)`**
+- loss 仍然只打在当前 sampled block 的 masked positions 上
 
-区别只是：
+这和 dFactory 的 `[x_t | x_0] + BD mask` 在目标上仍然一致：
 
-- pure attention 版本把这个语义塞进一次 forward
-- 我们把它拆成多次 prefix forward
+- 有 clean 视图
+- 有 noisy 视图
+- 当前 block 不能偷看自己的 clean 真值
+- 只恢复当前 block
 
 ### 4.2 推理时的语义
 
 推理也用同一套近似：
 
-1. 已经完成的 block 组成 clean history。
-2. 当前 block 初始化为全 `mask` 或部分 draft，记作 `x_t(b)`。
+1. `x0 stream` 保持 clean 视图。
+2. `xt stream` 的当前 block 初始化为全 `mask` 或部分 draft。
 3. 每一轮 refine：
-   - 输入 `x_0(<b) + x_t(b)`
-   - 得到当前 block 的 logits
-   - 更新 `x_t(b)`
-4. 当前 block 达到停止条件后，得到最终 `x_0(b)`。
-5. 把 `x_0(b)` 正式提交到 history，进入下一个 block。
+   - 两条流分别跑 causal GDN
+   - 后续 full-attention 按 reduced BD mask 融合
+   - 只更新 `xt stream` 的当前 block
+4. 当前 block 达到停止条件后，commit 成 clean block。
+5. 进入下一个 block。
 
-这就是 block-wise denoise，只不过不再追求 token-level exact cache 对齐，而是追求 block-level self-consistency。
+这仍然是 block-wise denoise，只不过是：
+
+- `SSM` 负责流内 causal 预混合
+- `attention` 负责 block-level BD 交互
+
+### 4.3 单流版本的定位
+
+之前文档里的单流近似：
+
+- `clean prefix + noisy current block`
+
+仍然是一个可用 fallback。它更省算力，也更容易写成最小原型。
+
+但如果目标是“尽量保留 dFactory 那种 dual-view 的味道，同时不强逼 SSM 学二维 mask”，当前更推荐的主线是双流版本。
 
 ## 5. 为什么这个近似对 SSM 更自然
 
@@ -129,17 +153,17 @@
 - token 级随机访问
 - 改一个 token 只局部修一点后续 state
 
-所以对它更自然的接口是：
+所以对它更自然的接口不是“让它自己做 BD”，而是：
 
-1. 从 block boundary 的历史状态开始。
-2. 在当前 block 上完整 rollout。
-3. 如果当前 block 内容变了，就从这个 boundary 重新 rollout 一次。
+1. `x0 stream` 内部做 clean causal mixing。
+2. `xt stream` 内部做 noisy causal mixing。
+3. 跨流的复杂交互，交给 attention mask 去控制。
 
-这正好对应我们的近似 BD：
+这正好对应我们当前主推的近似：
 
-- `block checkpoint`
-- `whole-block rerollout`
-- `finalize-on-commit`
+- `dual-stream`
+- `stream-local causal recurrence`
+- `cross-stream attention fusion`
 
 ## 6. Attention 和 SSM 各自怎么处理
 
@@ -160,7 +184,7 @@
 
 ### 6.1 Attention 分支
 
-Attention 这边可以更“像 BD 一点”，因为它天然支持：
+Attention 这边是主角，因为 BD 语义主要放在这里。它天然支持：
 
 - history cache
 - 当前 block 局部重算
@@ -168,10 +192,13 @@ Attention 这边可以更“像 BD 一点”，因为它天然支持：
 
 最简单的实现方式是：
 
-- 训练时直接吃 `x_0(<b) + x_t(b)` 这个前缀输入
+- GDN 先分别产出 `h_x0` 和 `h_xt`
+- 再把两条流拼成 attention 的输入视图
 - full-attention 层吃一张“裁剪版 BD” 的 4D additive mask
-- 这张 mask 只描述 `x_0(<b) + x_t(b)` 这个子图，而不是 dFactory 里的双倍长度 `[x_t | x_0]`
-- 当前 block 内部双向可见，同时对全部 clean prefix 可见
+- 这张 mask 描述的是“双流之间如何通信”，而不是让 GDN 自己理解 BD
+- `xt(b)` 可以看 `x0(<b)`
+- `xt(b)` 不能看 `x0(b)` 和 `x0(>b)`
+- attention 的 block size 可以大于 1；GDN 仍然维持 causal/block-1 语义
 
 一个关键实现点：
 
@@ -183,23 +210,20 @@ Attention 这边可以更“像 BD 一点”，因为它天然支持：
 
 ### 6.2 SSM / FLA 分支
 
-SSM 这边不要硬追 token-level exactness，直接接受 block 级近似。
+SSM 这边的任务要收窄，不要让它硬追 token-level exactness。
 
 具体做法：
 
-1. 在每个 block boundary 保存一次 `history_state`。
-2. 当前 block 每轮 refine：
-   - 从该 boundary 的 `history_state` 出发
-   - 用当前版本的 `x_t(b)` 重新跑完整个 block
-   - 得到新的当前 block 输出
-3. 在 block finalize 前，不把这轮 draft state 写回 history。
-4. block finalize 后，才用最终 `x_0(b)` 更新 history state。
+1. `x0 stream` 和 `xt stream` 分别维护各自独立的 state。
+2. 两个 GDN/DeltaNet 在本层内部不通信。
+3. 它们都保持纯 causal 递推。
+4. 真正的跨流信息交换只发生在 attention。
 
 这里的关键词只有三个：
 
-- `snapshot`
-- `rerollout`
-- `commit`
+- `dual-stream`
+- `independent state`
+- `attention-only communication`
 
 ## 7. 近似的本质：牺牲什么，保留什么
 
@@ -238,12 +262,15 @@ SSM 这边不要硬追 token-level exactness，直接接受 block 级近似。
 每个 step 只采一个或少数几个 block：
 
 1. 随机采样当前训练 block `b`
-2. 构造输入 `x_0(<b) + x_t(b)`
+2. 构造两条输入流：
+   - `x0 stream`
+   - `xt stream`，其中当前 sampled block 被替换成 `x_t(b)`
 3. 只对当前 block 计算 loss
 
 如果上下文太长，再进一步截断历史：
 
-- `x_0(b-K ... b-1) + x_t(b)`
+- `x0 stream` 只保留最近 `K` 个 clean history blocks
+- `xt stream` 只保留对应窗口里的 noisy current block 视图
 
 这会损失一部分长历史条件，但训练成本能压住。
 
@@ -278,7 +305,9 @@ loss 只打在当前 block 里被 mask 的位置。
 2. 当前 block 初始化为全 `mask`
 3. 做若干轮 refine：
    - 从同一个 boundary snapshot 出发
-   - 跑 `history + current draft block`
+   - 分别构造 `x0 stream` 和 `xt stream`
+   - 两条流各自跑 causal GDN/DeltaNet
+   - 再经过 reduced BD attention 融合
    - 更新 draft block
 4. block finalize
 5. 用最终 `x_0(b)` 更新历史 cache/state
@@ -298,7 +327,7 @@ loss 只打在当前 block 里被 mask 的位置。
 所以 MVP 更稳的落地是：
 
 1. `use_cache=False`
-2. 每轮 refine 都把 `clean prefix + current draft block` 整段重新前向一次
+2. 每轮 refine 都把双流输入整段重新前向一次
 3. 只更新当前 block
 4. 等主干调通后，再做 block-boundary snapshot / commit 优化
 
@@ -309,21 +338,23 @@ loss 只打在当前 block 里被 mask 的位置。
 
 ## 10. 为什么这条路值得试
 
-虽然这不是 exact BD，但它有三个现实优点：
+虽然这不是 exact BD，但它有四个现实优点：
 
 1. 不要求 `SSM` 学复杂二维 mask。
-2. 和 `SSM` 的 prefix-recurrence 本性一致。
-3. 训练和推理都能统一成 `clean prefix + noisy current block` 这个接口。
+2. 和 `SSM` 的 causal recurrence 本性一致。
+3. 比单流版本更接近 dFactory 的 dual-view 思路。
+4. 哪一部分在做近似、哪一部分在承载 BD 语义，职责更清楚。
 
 对 `Qwen-Next` 这种 hybrid 模型，这比强行把所有层都塞进 `[x_t | x_0] + custom mask` 更现实。
 
 ## 11. 主要风险
 
 1. 训练成本会明显高于单次 forward 的 pure-attention BD。
-2. block 太小，rerollout 次数太多，吞吐会难看。
-3. block 太大，当前块 denoise 难度会上去。
-4. hybrid 融合处仍可能出现“attention 更像 BD、SSM 更像 prefix LM”的张力。
-5. 如果 history/draft 隔离做不好，bug 会非常脏，而且不容易查。
+2. 双流 GDN 会带来接近 `2x` 的线性混合开销。
+3. block 太小，attention 融合次数太多，吞吐会难看。
+4. block 太大，当前块 denoise 难度会上去。
+5. hybrid 融合处仍可能出现“attention 更像 BD、SSM 更像 causal encoder”的张力。
+6. 如果 reduced BD mask 写错，`xt` 看到了 `x0(b)`，就会直接泄题。
 
 ## 12. 最小可行版本（MVP）
 
@@ -331,20 +362,26 @@ loss 只打在当前 block 里被 mask 的位置。
 
 1. 固定 block size。
 2. 每步只采一个 block 做训练。
-3. 训练输入只用 `clean prefix + noisy current block`。
-4. 数据侧保留真 `[MASK]` token，当前 block 按 `sigma` 随机做 masking。
-5. labels 只保留当前 block 的 masked positions，loss 用 same-token sparse CE，不做 next-token shift。
-6. 模型入口显式准备两份 mask：
+3. 数据侧保留真 `[MASK]` token，当前 sampled block 按 `sigma` 随机做 masking。
+4. 准备两条流：
+   - `x0 stream`
+   - `xt stream`
+5. 两条流各自跑 causal GDN/DeltaNet，state 独立，不通信。
+6. labels 只保留当前 block 的 masked positions，loss 用 same-token sparse CE，不做 next-token shift。
+7. 模型入口显式准备两份 mask：
    - `padding_mask_2d`
    - `bd_mask_4d`
-7. `full_attention` 只吃 `bd_mask_4d`，而且先固定走 eager/additive mask 路径。
-8. `DeltaNet / linear_attention` 只吃 `padding_mask_2d`，不去伪装成二维 BD。
-9. 第一版训练和推理都不要依赖 `ForCausalLM.forward()` 里的现成 loss，直接取 logits 自己算 sparse CE。
-10. 第一版推理 `use_cache=False`，每轮 refine 整段重跑 `clean prefix + current draft block`。
-11. 先不追求 fancy 的 token editing、MBE、RL，也先不追求 block-boundary cache 优化。
+8. `full_attention` 只吃 `bd_mask_4d`，而且先固定走 eager/additive mask 路径。
+9. `DeltaNet / linear_attention` 只吃各自流内需要的 `padding_mask_2d`，不去伪装成二维 BD。
+10. `bd_mask_4d` 的首要约束是：
+   - 允许 `xt(b) -> x0(<b)`
+   - 禁止 `xt(b) -> x0(b)`
+11. 第一版训练和推理都不要依赖 `ForCausalLM.forward()` 里的现成 loss，直接取 logits 自己算 sparse CE。
+12. 第一版推理 `use_cache=False`，每轮 refine 整段重跑双流输入。
+13. 先不追求 fancy 的 token editing、MBE、RL，也先不追求 block-boundary cache 优化。
 
 先把这条主干调通，再考虑更复杂的编辑机制。
 
 ## 13. 一句话总结
 
-**Qwen-Next 上做 Block Diffusion，不该强逼 SSM 去学 pure-attention 那套 `[x_t|x_0] + 2D mask`。更合理的做法是把 BD 改写成“clean history prefix + noisy current block”的多次前向近似版本：full-attention 吃 reduced 4D BD mask，DeltaNet 保持 prefix recurrence，第一版整段重跑，不碰 cache 黑魔法。**
+**Qwen-Next 上做 Block Diffusion，当前最像样的 best practice 是：`x0` 和 `xt` 走两条独立的 causal GDN/DeltaNet 流，不在 SSM 阶段通信；真正的 BD 语义由后续 full-attention 的 reduced 4D mask 承载。这样既保留了 Qwen-Next 的 hybrid 结构，又避免强逼 SSM 去学 pure-attention 的 exact BD。**
